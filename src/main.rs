@@ -34,33 +34,37 @@ type Bullets = Arc<Mutex<Vec<Bullet>>>;
 
 #[tokio::main]
 async fn main() {
+    // 게임 상태 변수 생성
     let players: Players = Arc::new(Mutex::new(HashMap::new()));
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let bullets: Bullets = Arc::new(Mutex::new(Vec::new())); // 총알 상태 관리
-
+    let bullets: Bullets = Arc::new(Mutex::new(Vec::new()));
+    
+    // 플레이어 입력 채널 생성
     let (tx, rx) = mpsc::channel::<PlayerInput>(100);
 
     // 게임 루프 실행
     let players_clone = players.clone();
     let clients_clone = clients.clone();
     let bullets_clone = bullets.clone();
-    tokio::spawn(game_loop(players_clone, clients_clone, rx, bullets_clone));
+    tokio::spawn(game_loop(players_clone, clients_clone,bullets_clone, rx));
 
+    // TCP 소켓 연결
     let listener = TcpListener::bind("127.0.0.1:30000").await.unwrap();
     println!("Server running on ws://127.0.0.1:30000");
 
+    // 클라이언트 연결 처리
     while let Ok((stream, _)) = listener.accept().await {
         let players = players.clone();
         let clients = clients.clone();
-        let tx = tx.clone();
         let bullets = bullets.clone();
+        let tx = tx.clone();
 
         tokio::spawn(async move {
             let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                 Ok(ws) => ws,
                 Err(_) => return,
             };
-            handle_connection(ws_stream, players, clients, tx, bullets).await;
+            handle_connection(ws_stream, players, clients, bullets, tx).await;
         });
     }
 }
@@ -69,8 +73,8 @@ async fn handle_connection(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     players: Players,
     clients: Clients,
-    tx: mpsc::Sender<PlayerInput>,
     bullets: Bullets,
+    tx: mpsc::Sender<PlayerInput>,
 ) {
     let id = Uuid::new_v4().to_string();
     println!("Player connected: {}", id);
@@ -118,7 +122,7 @@ async fn handle_connection(
     clients.lock().await.remove(&id);
 }
 
-async fn game_loop(players: Players, clients: Clients, mut rx: mpsc::Receiver<PlayerInput>, bullets: Bullets) {
+async fn game_loop(players: Players, clients: Clients, bullets: Bullets, mut rx: mpsc::Receiver<PlayerInput>) {
     let mut interval = time::interval(Duration::from_millis(10));
 
     loop {
@@ -174,8 +178,6 @@ async fn game_loop(players: Players, clients: Clients, mut rx: mpsc::Receiver<Pl
                     "players": player_states,
                     "bullets": bullets_json,
                 }).to_string();
-
-                println!("{}", state_json);
 
                 for tx in clients.values() {
                     let _ = tx.send(state_json.clone()).await;
