@@ -1,20 +1,35 @@
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
-use futures::{StreamExt, SinkExt};
+use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use uuid::Uuid;
-use serde_json::json;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{self, Duration};
+use tokio_tungstenite::tungstenite::protocol::Message;
+use uuid::Uuid;
 
-#[derive(Clone, Debug)]
+// Game state types
+type ClientId = String;
+type Clients = Arc<Mutex<HashMap<ClientId, mpsc::Sender<String>>>>;
+type Players = Arc<Mutex<HashMap<ClientId, Player>>>;
+type Bullets = Arc<Mutex<Vec<Bullet>>>;
+
+// Constants
+const SERVER_ADDR: &str = "127.0.0.1:30000";
+const GAME_TICK_MS: u64 = 10;
+const WORLD_WIDTH: f32 = 800.0;
+const WORLD_HEIGHT: f32 = 600.0;
+const INITIAL_PLAYER_X: f32 = 400.0;
+const INITIAL_PLAYER_Y: f32 = 300.0;
+
+// Game entities
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Player {
     x: f32,
     y: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Bullet {
     x: f32,
     y: f32,
@@ -23,50 +38,89 @@ struct Bullet {
     size: f32,
 }
 
-#[derive(Debug)]
-enum PlayerInput {
-    Move { id: String, x: f32, y: f32 },
+// Message types
+#[derive(Debug, Serialize, Deserialize)]
+enum GameCommand {
+    Move { x: f32, y: f32 },
+    Shoot { x: f32, y: f32, dx: f32, dy: f32, size: f32 },
 }
 
-type Players = Arc<Mutex<HashMap<String, Player>>>;
-type Clients = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
-type Bullets = Arc<Mutex<Vec<Bullet>>>;
+#[derive(Debug)]
+enum GameEvent {
+    PlayerInput { id: ClientId, command: GameCommand },
+    PlayerDisconnected { id: ClientId },
+}
+
+#[derive(Serialize)]
+struct InitMessage {
+    id: ClientId,
+    x: f32,
+    y: f32,
+}
+
+#[derive(Serialize)]
+struct GameState {
+    players: HashMap<ClientId, PlayerState>,
+    bullets: Vec<Bullet>,
+}
+
+#[derive(Serialize)]
+struct PlayerState {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum ClientMessage {
+    Init(InitMessage),
+    State(GameState),
+}
 
 #[tokio::main]
-async fn main() {
-    // 게임 상태 변수 생성
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting game server...");
+
+    // Initialize game state
     let players: Players = Arc::new(Mutex::new(HashMap::new()));
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
     let bullets: Bullets = Arc::new(Mutex::new(Vec::new()));
     
-    // 플레이어 입력 채널 생성
-    let (tx, rx) = mpsc::channel::<PlayerInput>(100);
+    // Create game event channel
+    let (tx, rx) = mpsc::channel::<GameEvent>(100);
 
-    // 게임 루프 실행
-    let players_clone = players.clone();
-    let clients_clone = clients.clone();
-    let bullets_clone = bullets.clone();
-    tokio::spawn(game_loop(players_clone, clients_clone,bullets_clone, rx));
+    // Start game loop
+    tokio::spawn(game_loop(
+        players.clone(),
+        clients.clone(),
+        bullets.clone(),
+        rx,
+    ));
 
-    // TCP 소켓 연결
-    let listener = TcpListener::bind("127.0.0.1:30000").await.unwrap();
-    println!("Server running on ws://127.0.0.1:30000");
+    // Start server
+    let listener = TcpListener::bind(SERVER_ADDR).await?;
+    println!("Server running on ws://{}", SERVER_ADDR);
 
-    // 클라이언트 연결 처리
-    while let Ok((stream, _)) = listener.accept().await {
+    // Accept client connections
+    while let Ok((stream, addr)) = listener.accept().await {
+        println!("New connection from: {}", addr);
+        
         let players = players.clone();
         let clients = clients.clone();
         let bullets = bullets.clone();
         let tx = tx.clone();
 
         tokio::spawn(async move {
-            let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-                Ok(ws) => ws,
-                Err(_) => return,
-            };
-            handle_connection(ws_stream, players, clients, bullets, tx).await;
+            match tokio_tungstenite::accept_async(stream).await {
+                Ok(ws_stream) => {
+                    handle_connection(ws_stream, players, clients, bullets, tx).await;
+                },
+                Err(e) => eprintln!("Error during WebSocket handshake: {}", e),
+            }
         });
     }
+
+    Ok(())
 }
 
 async fn handle_connection(
@@ -74,115 +128,229 @@ async fn handle_connection(
     players: Players,
     clients: Clients,
     bullets: Bullets,
-    tx: mpsc::Sender<PlayerInput>,
+    tx: mpsc::Sender<GameEvent>,
 ) {
-    let id = Uuid::new_v4().to_string();
-    println!("Player connected: {}", id);
+    // Generate unique client ID
+    let client_id = Uuid::new_v4().to_string();
+    println!("Player connected: {}", client_id);
 
-    let new_player = Player { x: 400.0, y: 300.0 };
-    let player_x = new_player.x;
-    let player_y = new_player.y;
-    players.lock().await.insert(id.clone(), new_player);
+    // Create new player
+    let new_player = Player {
+        x: INITIAL_PLAYER_X,
+        y: INITIAL_PLAYER_Y,
+    };
     
-    // 클라이언트 송신 채널 생성
+    // Add player to game state
+    players.lock().await.insert(client_id.clone(), new_player.clone());
+    
+    // Set up client message channel
     let (client_tx, mut client_rx) = mpsc::channel::<String>(10);
-    client_tx.send(json!({"init": { "id": id, "x": player_x, "y": player_y }}).to_string()).await.unwrap();
-    clients.lock().await.insert(id.clone(), client_tx);
+    
+    // Send initial state to client
+    let init_message = ClientMessage::Init(InitMessage {
+        id: client_id.clone(),
+        x: new_player.x,
+        y: new_player.y,
+    });
+    
+    if let Ok(json) = serde_json::to_string(&init_message) {
+        let _ = client_tx.send(json).await;
+    }
+    
+    // Add client channel to clients map
+    clients.lock().await.insert(client_id.clone(), client_tx);
 
+    // Split WebSocket stream
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-    // 클라이언트 송신 핸들러
-    tokio::spawn(async move {
+    // Forward messages from client_rx to WebSocket
+    let client_id_for_send = client_id.clone();
+    let tx_for_send = tx.clone();
+    let forward_task = tokio::spawn(async move {
         while let Some(msg) = client_rx.recv().await {
-            let _ = ws_sink.send(Message::Text(msg)).await;
+            if ws_sink.send(Message::Text(msg)).await.is_err() {
+                // Report disconnection if we can't send
+                let _ = tx_for_send.send(GameEvent::PlayerDisconnected {
+                    id: client_id_for_send.clone(),
+                }).await;
+                break;
+            }
         }
     });
 
-    // 메시지 수신 처리
+    // Process incoming WebSocket messages
     while let Some(Ok(msg)) = ws_stream.next().await {
         if let Message::Text(text) = msg {
-            let parts: Vec<&str> = text.split_whitespace().collect();
-            if parts.len() == 3 && parts[0] == "move" {
-                if let (Ok(x), Ok(y)) = (parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
-                    let _ = tx.send(PlayerInput::Move { id: id.clone(), x, y }).await;
-                }
-            } else if parts.len() == 6 && parts[0] == "shoot" {
-                if let (Ok(x), Ok(y), Ok(dx), Ok(dy), Ok(size)) = (parts[1].parse::<f32>(), parts[2].parse::<f32>(), parts[3].parse::<f32>(), parts[4].parse::<f32>(), parts[5].parse::<f32>()) {
-                    let mut bullets = bullets.lock().await;
-                    let bullet = Bullet { x, y, dx, dy, size, };
-                    bullets.push(bullet);
-                }
-
-            }
+            process_client_message(&client_id, &text, &tx, &bullets).await;
         }
     }
 
-    // 연결 종료 처리
-    players.lock().await.remove(&id);
-    clients.lock().await.remove(&id);
+    // Client disconnected, clean up
+    forward_task.abort();
+    
+    // Notify game loop about disconnection
+    let _ = tx.send(GameEvent::PlayerDisconnected {
+        id: client_id.clone(),
+    }).await;
+    
+    println!("Player disconnected: {}", client_id);
 }
 
-async fn game_loop(players: Players, clients: Clients, bullets: Bullets, mut rx: mpsc::Receiver<PlayerInput>) {
-    let mut interval = time::interval(Duration::from_millis(10));
+async fn process_client_message(
+    client_id: &str,
+    message: &str,
+    tx: &mpsc::Sender<GameEvent>,
+    bullets: &Bullets,
+) {
+    let parts: Vec<&str> = message.split_whitespace().collect();
+    
+    if parts.is_empty() {
+        return;
+    }
+    
+    match parts[0] {
+        "move" => {
+            if parts.len() == 3 {
+                if let (Ok(x), Ok(y)) = (parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                    let _ = tx.send(GameEvent::PlayerInput {
+                        id: client_id.to_string(),
+                        command: GameCommand::Move { x, y },
+                    }).await;
+                }
+            }
+        },
+        "shoot" => {
+            if parts.len() == 6 {
+                if let (Ok(x), Ok(y), Ok(dx), Ok(dy), Ok(size)) = (
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                    parts[3].parse::<f32>(),
+                    parts[4].parse::<f32>(),
+                    parts[5].parse::<f32>(),
+                ) {
+                    // Create bullet directly
+                    let mut bullets = bullets.lock().await;
+                    bullets.push(Bullet { x, y, dx, dy, size });
+                }
+            }
+        },
+        _ => {
+            // Ignore unknown commands
+        }
+    }
+}
+
+async fn game_loop(
+    players: Players,
+    clients: Clients,
+    bullets: Bullets,
+    mut rx: mpsc::Receiver<GameEvent>,
+) {
+    let mut interval = time::interval(Duration::from_millis(GAME_TICK_MS));
 
     loop {
         tokio::select! {
-            // 입력 메시지 처리
-            Some(input) = rx.recv() => {
-                match input {
-                    PlayerInput::Move { id, x, y } => {
-                        let mut players = players.lock().await;
-                        if let Some(player) = players.get_mut(&id) {
-                            player.x = x;
-                            player.y = y;
-                        }
+            // Process game events
+            Some(event) = rx.recv() => {
+                match event {
+                    GameEvent::PlayerInput { id, command } => {
+                        handle_player_input(&id, command, &players).await;
+                    },
+                    GameEvent::PlayerDisconnected { id } => {
+                        players.lock().await.remove(&id);
+                        clients.lock().await.remove(&id);
                     }
                 }
             }
-            // 주기적으로 모든 플레이어 상태 전송
+            
+            // Update game state and broadcast to clients
             _ = interval.tick() => {
-                // 총알 위치 업데이트
-                let mut bullets = bullets.lock().await;
-                bullets.iter_mut().for_each(|bullet| {
-                    bullet.x += bullet.dx;
-                    bullet.y += bullet.dy;
-                });
-
-                // 화면 밖으로 나간 총알 제거
-                bullets.retain(|bullet| bullet.x >= 0.0 && bullet.x <= 800.0 && bullet.y >= 0.0 && bullet.y <= 600.0);
-
-                // 플레이어 상태와 총알 정보를 클라이언트에 전송
-                let players = players.lock().await;
-                let clients = clients.lock().await;
-
-                let player_states: HashMap<String, HashMap<String, f32>> = players.iter()
-                    .map(|(id, player)| {
-                        (
-                            id.clone(),
-                            HashMap::from([("x".to_string(), player.x), ("y".to_string(), player.y)]),
-                        )
-                    })
-                    .collect();
-
-                let bullets_json = bullets.iter().map(|bullet| {
-                    json!({
-                        "x": bullet.x,
-                        "y": bullet.y,
-                        "dx": bullet.dx,
-                        "dy": bullet.dy,
-                        "size": bullet.size,
-                    })
-                }).collect::<Vec<_>>();
-
-                let state_json = json!({
-                    "players": player_states,
-                    "bullets": bullets_json,
-                }).to_string();
-
-                for tx in clients.values() {
-                    let _ = tx.send(state_json.clone()).await;
-                }
+                update_game_state(&bullets).await;
+                broadcast_game_state(&players, &clients, &bullets).await;
             }
+        }
+    }
+}
+
+async fn handle_player_input(
+    id: &str,
+    command: GameCommand,
+    players: &Players,
+) {
+    let mut players = players.lock().await;
+    
+    if let Some(player) = players.get_mut(id) {
+        match command {
+            GameCommand::Move { x, y } => {
+                player.x = x;
+                player.y = y;
+            },
+            GameCommand::Shoot { .. } => {
+                // Shooting is handled directly in process_client_message
+            }
+        }
+    }
+}
+
+async fn update_game_state(bullets: &Bullets) {
+    let mut bullets = bullets.lock().await;
+    
+    // Update bullet positions
+    bullets.iter_mut().for_each(|bullet| {
+        bullet.x += bullet.dx;
+        bullet.y += bullet.dy;
+    });
+    
+    // Remove bullets that are out of bounds
+    bullets.retain(|bullet| {
+        bullet.x >= 0.0 && 
+        bullet.x <= WORLD_WIDTH && 
+        bullet.y >= 0.0 && 
+        bullet.y <= WORLD_HEIGHT
+    });
+}
+
+async fn broadcast_game_state(
+    players: &Players,
+    clients: &Clients,
+    bullets: &Bullets,
+) {
+    let players_lock = players.lock().await;
+    let clients_lock = clients.lock().await;
+    
+    if clients_lock.is_empty() {
+        return;
+    }
+    
+    // Prepare player states
+    let player_states: HashMap<ClientId, PlayerState> = players_lock
+        .iter()
+        .map(|(id, player)| {
+            (
+                id.clone(),
+                PlayerState {
+                    x: player.x,
+                    y: player.y,
+                },
+            )
+        })
+        .collect();
+    
+    // Prepare bullet states
+    let bullets_lock = bullets.lock().await;
+    let bullet_states = bullets_lock.clone();
+    
+    // Create game state message
+    let game_state = ClientMessage::State(GameState {
+        players: player_states,
+        bullets: bullet_states,
+    });
+    
+    // Serialize game state
+    if let Ok(state_json) = serde_json::to_string(&game_state) {
+        // Broadcast to all clients
+        for tx in clients_lock.values() {
+            let _ = tx.send(state_json.clone()).await;
         }
     }
 }
